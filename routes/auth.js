@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const Owner = require('../models/Owner');
+const { PUBLIC_EVENT_SELECT } = require('../utils/publicEvent');
 const Contact = require('../models/Contact');
 const Event = require('../models/Event');
 const OwnerOtp = require('../models/OwnerOtp');
@@ -13,6 +14,13 @@ const {
 } = require('../services/ownerRanking');
 
 const router = express.Router();
+const { limitOtpAttempts } = require('../services/otpLimits');
+const BLOCKED_MESSAGE = 'Tu cuenta esta bloqueada. Contacta a soporte.';
+const rejectBlocked = (owner, res) => {
+  if (!owner?.moderation?.isBlocked) return false;
+  res.status(403).json({ message: BLOCKED_MESSAGE });
+  return true;
+};
 
 const OTP_TTL_MINUTES = 10;
 const SESSION_DAYS = 30;
@@ -173,7 +181,7 @@ const hasEventForOwnerEmail = async (email) => {
   const total = await Event.countDocuments({
     $or: [
       { ownerEmail: email },
-      { 'contactInfo.email': email }
+      { ownerEmail: { $in: [null, ''] }, 'contactInfo.email': email }
     ]
   });
   return total > 0;
@@ -217,7 +225,7 @@ const sendOwnerOtpEmail = async ({ email, code, purpose = 'signup' }) => {
   });
 };
 
-router.post('/request-otp', async (req, res) => {
+router.post('/request-otp', limitOtpAttempts('send'), async (req, res) => {
   try {
     const email = normalizeEmail(req.body.email);
     const requestedScope = String(req.body?.scope || '').trim().toLowerCase();
@@ -239,7 +247,7 @@ router.post('/request-otp', async (req, res) => {
 
     await OwnerOtp.deleteMany({ email });
 
-    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const code = String(crypto.randomInt(100000, 1000000));
     const codeHash = sha256(code);
     const expiresAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
 
@@ -285,7 +293,7 @@ router.post('/request-otp', async (req, res) => {
   }
 });
 
-router.post('/verify-otp', async (req, res) => {
+router.post('/verify-otp', limitOtpAttempts('verify'), async (req, res) => {
   try {
     const email = normalizeEmail(req.body.email);
     const code = String(req.body.code || '').trim();
@@ -318,6 +326,7 @@ router.post('/verify-otp', async (req, res) => {
     }
 
     let owner = await Owner.findOne({ email });
+    if (rejectBlocked(owner, res)) return;
     const isNewOwner = !owner;
     if (profileName || (isNewOwner && otp.scope === 'generic')) {
       const profileNameError = getProfileNameValidationMessage(profileName);
@@ -364,9 +373,9 @@ router.post('/verify-otp', async (req, res) => {
     await OwnerOtp.deleteMany({ email });
 
     const contactSet = {
-      isOwner,
       email
     };
+    if (isOwner || await hasEventForOwnerEmail(email)) contactSet.isOwner = true;
     if (profileName) {
       contactSet.name = profileName;
       contactSet.profileNameKey = normalizeProfileNameKey(profileName);
@@ -417,6 +426,7 @@ router.post('/login', async (req, res) => {
     }
 
     const owner = await Owner.findOne({ email });
+    if (rejectBlocked(owner, res)) return;
     if (!owner || !owner.passwordHash) {
       return res.status(400).json({ message: 'Cuenta sin contraseÃ±a, usa el cÃ³digo' });
     }
@@ -465,6 +475,7 @@ router.post('/google', async (req, res) => {
     }
 
     let owner = await Owner.findOne({ email });
+    if (rejectBlocked(owner, res)) return;
     const isNewOwner = !owner;
 
     if (!owner) {
@@ -490,6 +501,7 @@ router.post('/google', async (req, res) => {
 
     const token = await createOwnerSession(owner);
 
+    const existingContact = await Contact.findOne({ email });
     const googleProfileName = normalizeDisplayName(googleName);
     const googleContactSet = {
       email,
@@ -500,6 +512,7 @@ router.post('/google', async (req, res) => {
       }
     };
     if (
+      !existingContact?.name &&
       googleProfileName &&
       !getProfileNameValidationMessage(googleProfileName) &&
       await isProfileNameAvailable(googleProfileName, email)
@@ -511,7 +524,8 @@ router.post('/google', async (req, res) => {
     await Contact.findOneAndUpdate(
       { email },
       {
-        $set: googleContactSet
+        $setOnInsert: googleContactSet,
+        ...(await hasEventForOwnerEmail(email) ? { $set: { isOwner: true } } : {})
       },
       {
         upsert: true,
@@ -535,7 +549,7 @@ router.post('/google', async (req, res) => {
   }
 });
 
-router.post('/forgot-password/request', async (req, res) => {
+router.post('/forgot-password/request', limitOtpAttempts('send'), async (req, res) => {
   try {
     const email = normalizeEmail(req.body.email);
     if (!email) {
@@ -543,6 +557,7 @@ router.post('/forgot-password/request', async (req, res) => {
     }
 
     const owner = await Owner.findOne({ email });
+    if (rejectBlocked(owner, res)) return;
     if (!owner) {
       // Respuesta neutra para no revelar si el email existe.
       return res.json({ ok: true });
@@ -550,7 +565,7 @@ router.post('/forgot-password/request', async (req, res) => {
 
     await OwnerOtp.deleteMany({ email });
 
-    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const code = String(crypto.randomInt(100000, 1000000));
     const codeHash = sha256(code);
     const expiresAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
 
@@ -604,7 +619,7 @@ router.post('/forgot-password/request', async (req, res) => {
   }
 });
 
-router.post('/forgot-password/reset', async (req, res) => {
+router.post('/forgot-password/reset', limitOtpAttempts('verify'), async (req, res) => {
   try {
     const email = normalizeEmail(req.body.email);
     const code = String(req.body.code || '').trim();
@@ -619,6 +634,7 @@ router.post('/forgot-password/reset', async (req, res) => {
     }
 
     const owner = await Owner.findOne({ email });
+    if (rejectBlocked(owner, res)) return;
     if (!owner) {
       return res.status(400).json({ message: 'CÃ³digo invÃ¡lido' });
     }
@@ -680,6 +696,10 @@ const requireOwnerAuth = async (req, res, next) => {
       return res.status(401).json({ message: 'Sesion vencida' });
     }
 
+    if (rejectBlocked(session.ownerId, res)) {
+      await OwnerSession.deleteMany({ ownerId: session.ownerId._id });
+      return;
+    }
     req.owner = session.ownerId;
     req.ownerSession = session;
     return next();
@@ -854,7 +874,7 @@ router.get('/leaderboard', async (req, res) => {
 
 router.get('/favorites', requireOwnerAuth, async (req, res) => {
   try {
-    const owner = await Owner.findById(req.owner._id).populate('favorites');
+    const owner = await Owner.findById(req.owner._id).populate({ path: 'favorites', select: PUBLIC_EVENT_SELECT, match: { isActive: { $ne: false }, $or: [{ 'moderation.status': 'approved' }, { 'moderation.status': { $exists: false } }] } });
     return res.json({ favorites: owner?.favorites || [] });
   } catch (error) {
     return res.status(500).json({ message: error.message });

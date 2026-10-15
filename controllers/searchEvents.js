@@ -1,4 +1,6 @@
 const Event = require('../models/Event');
+const { buildOccasionQuery } = require('../utils/occasionSearch');
+const { PUBLIC_EVENT_SELECT } = require('../utils/publicEvent');
 
 exports.searchEvents = async (req, res) => {
   try {
@@ -13,9 +15,12 @@ exports.searchEvents = async (req, res) => {
     } = req.query;
 
     let query = {
-      isActive: true
+      isActive: { $ne: false },
+      $or: [{ 'moderation.status': 'approved' }, { 'moderation.status': { $exists: false } }]
     };
 
+    const occasionQuery = buildOccasionQuery(req.query.occasion);
+    if (occasionQuery) query.$and = [occasionQuery];
     if (type) query.type = type;
 
     if (province) query['location.province'] = province;
@@ -40,6 +45,7 @@ exports.searchEvents = async (req, res) => {
       };
 
       events = await Event.find(query)
+        .select(PUBLIC_EVENT_SELECT)
         .sort({ ownerTier: 1 })
         .lean();
     }
@@ -54,6 +60,6 @@ exports.searchEvents = async (req, res) => {
     res.json(events);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Error en búsqueda de eventos' });
+    res.status(error.status || 500).json({ error: 'Error en búsqueda de eventos' });
   }
 };

@@ -2,6 +2,9 @@ const express = require('express');
 const mongoose = require('mongoose');
 const router = express.Router();
 const Event = require('../models/Event');
+const { PUBLIC_EVENT_SELECT, PUBLIC_EVENT_PROJECTION } = require('../utils/publicEvent');
+const { buildOccasionQuery } = require('../utils/occasionSearch');
+const { requestDeletion } = require('../services/eventChanges');
 const { buildLocationQuery, buildNameQuery } = require('../utils/locationSearch');
 const Contact = require('../models/Contact');
 const Owner = require('../models/Owner');
@@ -201,7 +204,7 @@ const buildContactUpsertPayload = (eventDoc, email) => {
   const membershipPeriod = eventDoc?.membership?.period || 'year';
 
   return {
-    name: eventDoc?.name || '',
+    isOwner: true,
     email: ownerEmail,
     phone: eventDoc?.contactInfo?.phone || '',
     whatsapp: eventDoc?.contactInfo?.whatsapp || '',
@@ -308,6 +311,7 @@ const maybeSendPublicationLimitAlert = async (ownerEmail) => {
 };
 
 const APPROVED_QUERY = {
+  isActive: { $ne: false },
   $or: [
     { 'moderation.status': 'approved' },
     { moderation: { $exists: false } },
@@ -332,30 +336,7 @@ const PUBLIC_EVENT_LITE_SELECT = [
   'location.coordinates',
   'media.photos'
 ].join(' ');
-const PUBLIC_EVENT_PAGE_SELECT = [
-  '_id',
-  'name',
-  'slug',
-  'publicPath',
-  'publicPathCandidates',
-  'type',
-  'eventType',
-  'partyTypes',
-  'ownerTier',
-  'featured',
-  'createdAt',
-  'updatedAt',
-  'capacity',
-  'priceRange',
-  'pricing',
-  'plans',
-  'location',
-  'geoClassification',
-  'media',
-  'description',
-  'contactInfo',
-  'preferredContactMethod'
-].join(' ');
+const PUBLIC_EVENT_PAGE_SELECT = PUBLIC_EVENT_SELECT;
 const PUBLIC_EVENT_PATH_LOOKUP_SELECT = [
   '_id',
   'name',
@@ -495,8 +476,7 @@ router.get('/search', async (req, res) => {
       city, 
       minCapacity, 
       maxCapacity,
-      minPrice, 
-      maxPrice,
+      occasion,
       featured 
     } = req.query;
     
@@ -523,28 +503,37 @@ router.get('/search', async (req, res) => {
       if (maxCapacity) query['capacity.max'].$lte = parseInt(maxCapacity);
     }
     
-    if (minPrice || maxPrice) {
-      query['priceRange.min'] = {};
-      if (minPrice) query['priceRange.min'].$gte = parseInt(minPrice);
-      if (maxPrice) query['priceRange.min'].$lte = parseInt(maxPrice);
-    }
-    
+    const occasionQuery = buildOccasionQuery(occasion);
+    if (occasionQuery) query.$and.push(occasionQuery);
+
     if (featured === 'true') query.featured = true;
     
-    const events = await Event.find(query).sort({ featured: -1, createdAt: -1 });
+    const events = await Event.find(query).select(PUBLIC_EVENT_SELECT).sort({ featured: -1, createdAt: -1 });
     res.json({
       count: events.length,
       events
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(error.status || 500).json({ message: error.message });
   }
 });
 
 // GET - Obtener eventos destacados
+router.get('/public-batch', async (req, res) => {
+  const ids = [...new Set(String(req.query.ids || '').split(',').filter(Boolean))];
+  if (!ids.length || ids.length > 100 || ids.some(id => !mongoose.isValidObjectId(id))) {
+    return res.status(400).json({ message: 'Lista de publicaciones invalida' });
+  }
+  try {
+    const events = await Event.find({ _id: { $in: ids }, ...APPROVED_QUERY }).select(PUBLIC_EVENT_LITE_SELECT).lean();
+    res.set('Cache-Control', 'no-store');
+    return res.json(events);
+  } catch { return res.status(500).json({ message: 'No se pudo consultar la disponibilidad' }); }
+});
+
 router.get('/featured', async (req, res) => {
   try {
-    const events = await Event.find({ featured: true, ...APPROVED_QUERY }).limit(6);
+    const events = await Event.find({ featured: true, ...APPROVED_QUERY }).select(PUBLIC_EVENT_SELECT).limit(6);
     res.json(events);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -573,7 +562,7 @@ router.get('/featured-near', async (req, res) => {
           $maxDistance: Number(radius)
         }
       }
-    }).limit(Number(limit));
+    }).select(PUBLIC_EVENT_SELECT).limit(Number(limit));
 
     res.json(events);
   } catch (error) {
@@ -836,7 +825,8 @@ router.get('/:id/related', async (req, res) => {
             query: baseMatch
           }
         },
-        { $limit: limit }
+        { $limit: limit },
+        { $project: PUBLIC_EVENT_PROJECTION }
       ]);
       pushUnique(nearRelated);
     }
@@ -849,6 +839,7 @@ router.get('/:id/related', async (req, res) => {
         'location.province': event?.location?.province,
         _id: { $nin: excludedIds }
       })
+        .select(PUBLIC_EVENT_SELECT)
         .sort({ featured: -1, createdAt: -1 })
         .limit(limit - picked.length);
       pushUnique(sameCityRelated);
@@ -860,6 +851,7 @@ router.get('/:id/related', async (req, res) => {
         ...baseMatch,
         _id: { $nin: excludedIds }
       })
+        .select(PUBLIC_EVENT_SELECT)
         .sort({ featured: -1, createdAt: -1 })
         .limit(limit - picked.length);
       pushUnique(fallbackRelated);
@@ -877,7 +869,7 @@ router.get('/mine', requireOwnerAuth, async (req, res) => {
     const events = await Event.find({
       $or: [
         { ownerEmail: email },
-        { 'contactInfo.email': email }
+        { ownerEmail: { $in: [null, ''] }, 'contactInfo.email': email }
       ]
     }).sort({ createdAt: -1 });
     res.json(events);
@@ -897,7 +889,7 @@ router.get('/owner/:id', requireOwnerAuth, async (req, res) => {
     const ownerEmail = req.owner?.email;
     const matchesOwnerEmail = event.ownerEmail === ownerEmail;
     const matchesContactEmail =
-      event.contactInfo?.email &&
+      !event.ownerEmail && event.contactInfo?.email &&
       event.contactInfo.email.toLowerCase() === ownerEmail;
 
     if (!matchesOwnerEmail && !matchesContactEmail) {
@@ -1151,6 +1143,7 @@ router.get('/', async (req, res) => {
       query = query.select(PUBLIC_EVENT_LITE_SELECT).slice('media.photos', 1).lean();
     }
 
+    if (view !== 'lite') query = query.select(PUBLIC_EVENT_SELECT);
     const events = await query;
     res.json(view === 'lite' ? events.map(normalizePublicEventLite) : events);
   } catch (error) {
@@ -1248,7 +1241,7 @@ router.post('/:id/reviews', requireOwnerAuth, async (req, res) => {
 // GET - Obtener un evento por ID
 router.get('/:id', async (req, res) => {
   try {
-    const event = await Event.findOne({ _id: req.params.id, ...APPROVED_QUERY });
+    const event = await Event.findOne({ _id: req.params.id, ...APPROVED_QUERY }).select(PUBLIC_EVENT_SELECT);
     if (!event) {
       return res.status(404).json({ message: 'Evento no encontrado' });
     }
@@ -1391,125 +1384,16 @@ router.post('/', async (req, res) => {
 });
 
 // PUT - Actualizar un evento
-router.put('/:id', requireOwnerAuth, async (req, res) => {
-  try {
-    const event = await Event.findById(req.params.id);
-
-    if (!event) {
-      return res.status(404).json({ message: 'Evento no encontrado' });
-    }
-
-    const ownerEmail = req.owner?.email;
-    const bodyOwnerEmail = req.body?.contactInfo?.email;
-    if (await isOwnerBlocked(ownerEmail)) {
-      return res.status(403).json({ message: BLOCKED_OWNER_MESSAGE });
-    }
-
-    if (event.ownerEmail) {
-      if (event.ownerEmail !== ownerEmail) {
-        return res.status(403).json({ message: 'No autorizado' });
-      }
-    } else {
-      if (!bodyOwnerEmail || bodyOwnerEmail.toLowerCase() !== ownerEmail) {
-        return res.status(403).json({ message: 'No autorizado' });
-      }
-    }
-
-    const payload = { ...req.body };
-    delete payload.ownerEmail;
-    if (!payload.eventType) {
-      const firstPartyType = Array.isArray(payload.partyTypes)
-        ? payload.partyTypes.find((item) => typeof item === 'string' && item.trim())
-        : null;
-      payload.eventType = firstPartyType || event.eventType || 'otro';
-    }
-    if (!EVENT_TYPES.has(payload.eventType)) {
-      payload.eventType = 'otro';
-    }
-    const finalName = normalizePublicationName(payload?.name || event?.name);
-    if (!finalName) {
-      return res.status(400).json({ message: 'Nombre de publicacion requerido' });
-    }
-    const duplicate = await findDuplicateEventByOwner({
-      ownerEmail,
-      name: finalName,
-      excludeEventId: event._id
-    });
-    if (duplicate) {
-      return res.status(409).json({
-        message: 'Ya tienes una publicacion con ese nombre'
-      });
-    }
-    payload.moderation = {
-      status: 'pending'
-    };
-
-    if (!event.ownerEmail) {
-      payload.ownerEmail = ownerEmail;
-    }
-
-    const nextPayload = {
-      ...payload,
-      ...getPublicPathFields({ ...event.toObject(), ...payload })
-    };
-
-    const updated = await Event.findByIdAndUpdate(
-      req.params.id,
-      nextPayload,
-      { new: true, runValidators: true }
-    );
-
-    const contactEmail = (updated.ownerEmail || updated.contactInfo?.email || '')
-      .trim()
-      .toLowerCase();
-    if (contactEmail) {
-      const contactDoc = buildContactUpsertPayload(updated, contactEmail);
-
-      await Contact.findOneAndUpdate(
-        { email: contactEmail },
-        {
-          $set: contactDoc,
-          $addToSet: { events: updated._id }
-        },
-        {
-          upsert: true,
-          new: true,
-          runValidators: true,
-          setDefaultsOnInsert: true
-        }
-      );
-    }
-
-    res.json(updated);
-  } catch (error) {
-    res.status(400).json({ message: error.message });
-  }
+router.put('/:id', requireOwnerAuth, (req, res) => {
+  res.status(409).json({ message: 'Envia los cambios a revision desde el editor actualizado', code: 'REVIEW_REQUIRED' });
 });
 
-// DELETE - Eliminar un evento
 router.delete('/:id', requireOwnerAuth, async (req, res) => {
   try {
-    const event = await Event.findById(req.params.id);
-
-    if (!event) {
-      return res.status(404).json({ message: 'Evento no encontrado' });
-    }
-
-    const ownerEmail = req.owner?.email;
-    const matchesOwnerEmail = event.ownerEmail === ownerEmail;
-    const matchesContactEmail =
-      event.contactInfo?.email &&
-      event.contactInfo.email.toLowerCase() === ownerEmail;
-
-    if (!matchesOwnerEmail && !matchesContactEmail) {
-      return res.status(403).json({ message: 'No autorizado' });
-    }
-
-    await Event.findByIdAndDelete(req.params.id);
-
-    res.json({ message: 'Evento eliminado correctamente' });
+    const submission = await requestDeletion(req.params.id, req.owner.email);
+    res.status(202).json({ id: submission._id, status: 'pending', message: 'Solicitud de baja enviada a revision' });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(error.status || 400).json({ message: error.message });
   }
 });
 

@@ -13,6 +13,10 @@ const pendingMediaItemSchema = new mongoose.Schema(
 
 const pendingSubmissionSchema = new mongoose.Schema(
   {
+    operation: { type: String, enum: ['create', 'edit', 'delete'], default: 'create' },
+    targetEventId: { type: mongoose.Schema.Types.ObjectId, ref: 'Event' },
+    eventSnapshot: mongoose.Schema.Types.Mixed,
+    ready: { type: Boolean, default: true },
     status: {
       type: String,
       enum: ['pending', 'approved', 'rejected'],
@@ -55,5 +59,10 @@ const pendingSubmissionSchema = new mongoose.Schema(
     collection: 'pending_submissions'
   }
 );
+
+pendingSubmissionSchema.index({ targetEventId: 1 }, {
+  unique: true,
+  partialFilterExpression: { status: 'pending', targetEventId: { $type: 'objectId' } }
+});
 
 module.exports = mongoose.model('PendingSubmission', pendingSubmissionSchema);

@@ -14,6 +14,10 @@ const newsletterRoutes = require('./routes/newsletter');
 const aportesRoutes = require('./routes/aportes');
 
 const app = express();
+// Set trusted proxy addresses/CIDRs in deployment; do not trust arbitrary forwarded IPs.
+if (process.env.TRUST_PROXY) {
+  app.set('trust proxy', process.env.TRUST_PROXY.split(',').map(value => value.trim()).filter(Boolean));
+}
 
 const normalizeOrigin = (value) => {
   if (!value) return '';

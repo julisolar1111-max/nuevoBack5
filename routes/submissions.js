@@ -1,9 +1,11 @@
 const path = require('path');
+const crypto = require('crypto');
 const fs = require('fs/promises');
 const express = require('express');
 const multer = require('multer');
 const PendingSubmission = require('../models/PendingSubmission');
 const Event = require('../models/Event');
+const { EDITABLE_FIELDS, pick, snapshotEvent, ownsEvent, approveEventChange } = require('../services/eventChanges');
 const Contact = require('../models/Contact');
 const Owner = require('../models/Owner');
 const OwnerSession = require('../models/OwnerSession');
@@ -13,6 +15,7 @@ const {
 } = require('../services/mediaProcessor');
 const { sendTransactionalEmail } = require('../services/transactionalEmail');
 
+const { requireOwnerAuth } = require('./auth');
 const router = express.Router();
 
 const upload = multer({
@@ -65,7 +68,7 @@ const hasValidReviewToken = (req) => {
 };
 
 const isMasterSubmissionRequest = (req) =>
-  String(req.body?.submissionMode || '').trim() === MASTER_SUBMISSION_MODE && hasValidReviewToken(req);
+  String(req.body?.submissionMode || '').trim() === MASTER_SUBMISSION_MODE && Boolean(getExpectedReviewToken()) && hasValidReviewToken(req);
 
 const buildSyntheticOwnerEmail = (seed = '') => {
   const normalizedSeed = String(seed || '')
@@ -87,7 +90,7 @@ const isMasterDraft = (draft = {}) =>
 
 const ensureReviewAccess = (req, res, next) => {
   const expected = getExpectedReviewToken();
-  if (!expected) return next();
+  if (!expected) return res.status(503).json({ message: 'Configura el token de revision para administrar solicitudes' });
 
   if (!hasValidReviewToken(req)) {
     return res.status(401).json({ message: 'No autorizado para revisar publicaciones' });
@@ -104,7 +107,7 @@ const buildContactUpsert = (eventDoc) => {
   return {
     email: ownerEmail,
     doc: {
-      name: eventDoc.name,
+      isOwner: true,
       email: ownerEmail,
       phone: eventDoc.contactInfo?.phone || '',
       whatsapp: eventDoc.contactInfo?.whatsapp || '',
@@ -456,6 +459,8 @@ router.post(
     { name: 'videos', maxCount: 10 }
   ]),
   async (req, res) => {
+    let createdPending;
+    let pendingReady = false;
     try {
       const draftRaw = String(req.body?.eventDraft || '').trim();
       const approvedByOwner = String(req.body?.approvedByOwner || '').trim() === 'true';
@@ -478,7 +483,30 @@ router.post(
       }
 
       const isMasterMode = isMasterSubmissionRequest(req);
-      let ownerEmail = normalizeEmail(eventDraft?.contactInfo?.email || eventDraft?.ownerEmail);
+      if (!isMasterMode) {
+        let authenticated = false;
+        await requireOwnerAuth(req, res, () => { authenticated = true; });
+        if (!authenticated) return;
+      }
+      const operation = String(req.body?.operation || 'create');
+      if (!['create', 'edit'].includes(operation)) return res.status(400).json({ message: 'Operacion invalida' });
+      let targetEvent = null;
+      let eventSnapshot;
+      if (operation === 'edit') {
+        if (!req.owner) return res.status(403).json({ message: 'Inicia sesion como propietario para editar' });
+        targetEvent = await Event.findById(req.body.targetEventId);
+        if (!targetEvent) return res.status(404).json({ message: 'Publicacion no encontrada' });
+        if (!ownsEvent(targetEvent, req.owner.email)) return res.status(403).json({ message: 'No autorizado' });
+        if (targetEvent.isActive === false) return res.status(409).json({ message: 'La publicacion esta inhabilitada' });
+        if (await PendingSubmission.exists({ targetEventId: targetEvent._id, status: 'pending' })) {
+          return res.status(409).json({ message: 'Ya hay una solicitud pendiente para este espacio' });
+        }
+        eventSnapshot = snapshotEvent(targetEvent);
+        eventDraft = { ...eventSnapshot, ...pick(eventDraft, EDITABLE_FIELDS) };
+      }
+      let ownerEmail = isMasterMode
+        ? normalizeEmail(eventDraft?.contactInfo?.email || eventDraft?.ownerEmail)
+        : req.owner.email;
 
       if (!ownerEmail && !isMasterMode) {
         return res.status(400).json({ message: 'Email de contacto requerido' });
@@ -493,7 +521,8 @@ router.post(
       if (!isSyntheticMasterOwnerEmail(ownerEmail)) {
         const duplicate = await findDuplicateEventByOwner({
           ownerEmail,
-          name: eventDraft?.name
+          name: eventDraft?.name,
+          excludeEventId: targetEvent?._id
         });
         if (duplicate) {
           return res.status(409).json({
@@ -503,6 +532,7 @@ router.post(
       }
 
       const pending = await PendingSubmission.create({
+        operation, targetEventId: targetEvent?._id, eventSnapshot, ready: false,
         status: 'pending',
         eventDraft: {
           ...eventDraft,
@@ -513,6 +543,7 @@ router.post(
         moderation: { approvedByOwner: true }
       });
 
+      createdPending = pending;
       const submissionDir = path.join(
         __dirname,
         '..',
@@ -553,8 +584,13 @@ router.post(
         photos: savedPhotos,
         videos: savedVideos
       };
+      pending.ready = true;
       await pending.save();
-      if (!isSyntheticMasterOwnerEmail(ownerEmail)) {
+      pendingReady = true;
+      if (!isMasterMode) {
+        await Contact.updateOne({ email: ownerEmail }, { $set: { isOwner: true } });
+      }
+      if (operation === 'create' && !isSyntheticMasterOwnerEmail(ownerEmail)) {
         await maybeSendPublicationLimitAlert(ownerEmail);
       }
 
@@ -564,6 +600,15 @@ router.post(
         message: 'Publicacion enviada a revision correctamente'
       });
     } catch (error) {
+      if (createdPending && pendingReady) {
+        console.error('Solicitud guardada; fallo una tarea posterior', error.message);
+        return res.status(201).json({ id: createdPending._id, status: 'pending', message: 'Publicacion enviada a revision' });
+      }
+      if (createdPending && !pendingReady) {
+        await PendingSubmission.deleteOne({ _id: createdPending._id, ready: false });
+        await cleanupSubmissionLocalMedia(createdPending);
+      }
+      if (error.code === 11000) return res.status(409).json({ message: 'Ya hay una solicitud pendiente para este espacio' });
       return res.status(400).json({
         message: error?.message || 'No pudimos crear la solicitud de revision'
       });
@@ -571,10 +616,26 @@ router.post(
   }
 );
 
+router.get('/mine', requireOwnerAuth, async (req, res) => {
+  try {
+    const rows = await PendingSubmission.find({
+      'eventDraft.ownerEmail': req.owner.email,
+      status: { $in: ['pending', 'rejected'] },
+      ready: { $ne: false }
+    }).select('operation targetEventId status eventDraft.name eventDraft.location eventDraft.capacity reviewerNote createdAt').sort({ createdAt: -1 }).lean();
+    res.json(rows.map(row => ({
+      _id: row._id, name: row.eventDraft?.name,
+      location: row.eventDraft?.location, capacity: row.eventDraft?.capacity,
+      operation: row.operation || 'create', targetEventId: row.targetEventId,
+      status: row.status, reviewerNote: row.reviewerNote, isSubmission: true
+    })));
+  } catch (error) { res.status(500).json({ message: 'No pudimos cargar tus solicitudes' }); }
+});
+
 router.get('/', ensureReviewAccess, async (req, res) => {
   try {
     const status = normalizeStatus(req.query?.status || 'pending');
-    const query = {};
+    const query = { ready: { $ne: false } };
     if (['pending', 'approved', 'rejected'].includes(status)) {
       query.status = status;
     }
@@ -759,7 +820,7 @@ router.get('/:id', ensureReviewAccess, async (req, res) => {
     if (!submission) {
       return res.status(404).json({ message: 'Solicitud no encontrada' });
     }
-    const duplicateCandidates = await buildDuplicateCandidates(submission.eventDraft || {});
+    const duplicateCandidates = (await buildDuplicateCandidates(submission.eventDraft || {})).filter(item => String(item.eventId) !== String(submission.targetEventId || ''));
     return res.json({
       ...submission,
       duplicateCandidates
@@ -780,15 +841,21 @@ router.put('/:id', ensureReviewAccess, async (req, res) => {
       return res.status(400).json({ message: 'Solo se pueden editar solicitudes pendientes o rechazadas' });
     }
 
+    if (submission.operation === 'delete') return res.status(400).json({ message: 'Una solicitud de baja no permite editar datos' });
     const incomingDraft = req.body?.eventDraft;
     if (!incomingDraft || typeof incomingDraft !== 'object' || Array.isArray(incomingDraft)) {
       return res.status(400).json({ message: 'eventDraft invalido' });
     }
 
     const currentDraft = submission.eventDraft || {};
+    if (submission.operation === 'edit') {
+      for (const key of Object.keys(incomingDraft)) {
+        if (!EDITABLE_FIELDS.includes(key)) delete incomingDraft[key];
+      }
+    }
     const isMasterMode = isMasterDraft(incomingDraft) || isMasterDraft(currentDraft);
     let ownerEmail = normalizeEmail(
-      incomingDraft?.ownerEmail || incomingDraft?.contactInfo?.email || currentDraft?.ownerEmail
+      incomingDraft?.ownerEmail || currentDraft?.ownerEmail || incomingDraft?.contactInfo?.email
     );
 
     if (!ownerEmail && !isMasterMode) {
@@ -802,7 +869,8 @@ router.put('/:id', ensureReviewAccess, async (req, res) => {
     if (!isSyntheticMasterOwnerEmail(ownerEmail)) {
       const duplicate = await findDuplicateEventByOwner({
         ownerEmail,
-        name: incomingDraft?.name
+        name: incomingDraft?.name,
+        excludeEventId: submission.targetEventId
       });
       if (duplicate) {
         return res.status(409).json({
@@ -823,14 +891,61 @@ router.put('/:id', ensureReviewAccess, async (req, res) => {
         email:
           isSyntheticMasterOwnerEmail(ownerEmail) && !providedContactEmail
             ? ''
-            : ownerEmail
+            : providedContactEmail || normalizeEmail(currentDraft?.contactInfo?.email || ownerEmail)
       }
     };
 
-    await submission.save();
-    return res.json({ ok: true, submission });
+    const updated = await PendingSubmission.findOneAndUpdate({ _id: submission._id, status: submission.status, updatedAt: submission.updatedAt }, { $set: { eventDraft: submission.eventDraft } }, { new: true, runValidators: true });
+    if (!updated) return res.status(409).json({ message: 'La solicitud cambio durante la edicion. Recarga el detalle' });
+    return res.json({ ok: true, submission: updated });
   } catch (error) {
     return res.status(400).json({ message: error?.message || 'No pudimos actualizar la solicitud' });
+  }
+});
+
+router.post('/:id/media', ensureReviewAccess, upload.fields([
+  { name: 'photos', maxCount: 100 }, { name: 'videos', maxCount: 10 }
+]), async (req, res) => {
+  const addedPaths = [];
+  let committed = false;
+  try {
+    const submission = await PendingSubmission.findById(req.params.id);
+    if (!submission) return res.status(404).json({ message: 'Solicitud no encontrada' });
+    if (submission.operation === 'delete' || submission.ready === false || !['pending', 'rejected'].includes(submission.status)) {
+      return res.status(409).json({ message: 'No se puede modificar la media de esta solicitud' });
+    }
+    const parseIndexes = value => {
+      const indexes = JSON.parse(value || '[]');
+      if (!Array.isArray(indexes) || indexes.some(index => !Number.isInteger(index) || index < 0)) {
+        throw new Error('Indices de media invalidos');
+      }
+      return new Set(indexes);
+    };
+    const removals = { photos: parseIndexes(req.body.removePhotoIndexes), videos: parseIndexes(req.body.removeVideoIndexes) };
+    const directory = path.join(__dirname, '..', 'uploads', 'pending', String(submission._id));
+    await fs.mkdir(directory, { recursive: true });
+    const localMedia = {};
+    for (const kind of ['photos', 'videos']) {
+      localMedia[kind] = (submission.localMedia?.[kind] || []).filter((_, index) => !removals[kind].has(index));
+      for (const file of req.files?.[kind] || []) {
+        const filename = `${crypto.randomUUID()}-${sanitizeFilename(file.originalname)}`;
+        const filePath = path.join(directory, filename);
+        addedPaths.push(filePath);
+        await fs.writeFile(filePath, file.buffer);
+        localMedia[kind].push({ filename: file.originalname, path: filePath,
+          publicUrl: `/uploads/pending/${submission._id}/${filename}`, mime: file.mimetype || '', bytes: file.size || 0 });
+      }
+    }
+    const updated = await PendingSubmission.findOneAndUpdate({
+      _id: submission._id, status: submission.status, updatedAt: submission.updatedAt
+    }, { $set: { localMedia } }, { new: true, runValidators: true });
+    if (!updated) return res.status(409).json({ message: 'La solicitud cambio. Recarga antes de guardar' });
+    committed = true;
+    return res.json({ ok: true, submission: updated });
+  } catch (error) {
+    return res.status(400).json({ message: error.message || 'No se pudo actualizar la media' });
+  } finally {
+    if (!committed) await Promise.allSettled(addedPaths.map(filePath => fs.unlink(filePath)));
   }
 });
 
@@ -854,10 +969,11 @@ router.post('/:id/reject', ensureReviewAccess, async (req, res) => {
     const ownerEmail = normalizeEmail(draft?.ownerEmail || draft?.contactInfo?.email);
     const eventName = String(draft?.name || 'tu publicacion').trim();
 
-    submission.status = 'rejected';
-    submission.reviewerNote = reviewerNote;
-    submission.reviewedAt = new Date();
-    await submission.save();
+    const rejected = await PendingSubmission.findOneAndUpdate({ _id: submission._id, status: { $in: ['pending', 'rejected'] }, ready: { $ne: false } }, { $set: { status: 'rejected', reviewerNote, reviewedAt: new Date() } }, { new: true });
+    if (!rejected) return res.status(409).json({ message: 'La solicitud ya fue resuelta' });
+    submission.status = rejected.status;
+    submission.reviewerNote = rejected.reviewerNote;
+    submission.reviewedAt = rejected.reviewedAt;
 
     let notification = { attempted: false, sent: false, reason: 'missing-recipient' };
     if (ownerEmail) {
@@ -888,10 +1004,14 @@ router.post('/:id/approve', ensureReviewAccess, async (req, res) => {
     if (!submission) {
       return res.status(404).json({ message: 'Solicitud no encontrada' });
     }
-    if (submission.status !== 'pending') {
+    if (submission.status !== 'pending' || submission.ready === false) {
       return res.status(400).json({ message: 'Solo se pueden aprobar solicitudes pendientes' });
     }
 
+    if (submission.operation === 'delete') {
+      const event = await approveEventChange(submission._id, null, req.body?.note, submission);
+      return res.json({ ok: true, eventId: event._id, operation: 'delete', message: 'Publicacion inhabilitada' });
+    }
     const draft = submission.eventDraft || {};
     const ownerEmail = normalizeEmail(draft?.ownerEmail || draft?.contactInfo?.email);
     const isMasterMode = String(draft?.submissionMode || '').trim() === MASTER_SUBMISSION_MODE;
@@ -904,7 +1024,8 @@ router.post('/:id/approve', ensureReviewAccess, async (req, res) => {
     if (!isSyntheticMasterOwnerEmail(ownerEmail)) {
       const duplicate = await findDuplicateEventByOwner({
         ownerEmail,
-        name: draft?.name
+        name: draft?.name,
+        excludeEventId: submission.targetEventId
       });
       if (duplicate) {
         return res.status(409).json({
@@ -973,7 +1094,7 @@ router.post('/:id/approve', ensureReviewAccess, async (req, res) => {
         ...(draft.contactInfo || {}),
         email: isSyntheticMasterOwnerEmail(ownerEmail)
           ? normalizeEmail(draft?.contactInfo?.email || '')
-          : ownerEmail
+          : normalizeEmail(draft?.contactInfo?.email || ownerEmail)
       },
       moderation: {
         status: 'approved',
@@ -987,6 +1108,7 @@ router.post('/:id/approve', ensureReviewAccess, async (req, res) => {
             order: index
           })),
           ...draftPhotoLinks.map((url, index) => ({
+            ...(submission.eventSnapshot?.media?.photos || []).find(photo => photo.url === url),
             url,
             order: uploadedPhotos.length + index
           }))
@@ -1012,6 +1134,11 @@ router.post('/:id/approve', ensureReviewAccess, async (req, res) => {
       }
     };
 
+    if (submission.operation === 'edit') {
+      const event = await approveEventChange(submission._id, finalEventPayload, req.body?.note, submission);
+      await cleanupSubmissionLocalMedia(submission);
+      return res.json({ ok: true, eventId: event._id, operation: 'edit', message: 'Cambios aprobados' });
+    }
     const event = await Event.create(finalEventPayload);
 
     const contactUpsert =
@@ -1051,7 +1178,7 @@ router.post('/:id/approve', ensureReviewAccess, async (req, res) => {
       submission
     });
   } catch (error) {
-    return res.status(400).json({ message: error?.message || 'No pudimos aprobar la solicitud' });
+    return res.status(error.status || 400).json({ message: error?.message || 'No pudimos aprobar la solicitud' });
   }
 });
 

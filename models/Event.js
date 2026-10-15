@@ -210,6 +210,8 @@ const eventSchema = new mongoose.Schema({
   },
   
   // Campos utiles
+  disabledAt: Date,
+  disabledReason: String,
   isActive: {
     type: Boolean,
     default: true
