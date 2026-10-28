@@ -820,7 +820,7 @@ router.get('/:id', ensureReviewAccess, async (req, res) => {
     if (!submission) {
       return res.status(404).json({ message: 'Solicitud no encontrada' });
     }
-    const duplicateCandidates = (await buildDuplicateCandidates(submission.eventDraft || {})).filter(item => String(item.eventId) !== String(submission.targetEventId || ''));
+    const duplicateCandidates = (await buildDuplicateCandidates(submission.eventDraft || {})).candidates.filter(item => String(item.eventId) !== String(submission.targetEventId || ''));
     return res.json({
       ...submission,
       duplicateCandidates
